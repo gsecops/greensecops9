@@ -1,0 +1,226 @@
+name: 'post-workflow-run-metadata'
+description: 'Used to sync workflow metadata with sonic datasources'
+inputs:
+  request-id: 
+    required: false
+  app: 
+    required: true
+  app-repository:
+    required: true
+  branch:
+    required: true
+  pr-number:
+    required: true
+  deployment-type:
+    required: true
+  environments:
+    required: true
+  version:
+    required: true
+  multiple-environments:
+    required: false
+    default: "false"
+  orchestrator-base-url-stg:
+    required: true
+  orchestrator-base-url-prd:
+    required: true
+  orchestrator-api-key-stg:
+    required: true
+  orchestrator-api-key-prd:
+    required: true
+outputs:
+  pr_id:
+    description: "Sonic pr-id"
+    value: ${{ steps.fetch_data_production.outputs.pr_id }}'
+  quality_gates_conclusion:
+    description: "Quality gates status"
+    value: ${{ steps.fetch_data_production.outputs.quality_gates_conclusion }}
+  pr_merged_time:
+    description: "PR merged time"
+    value: ${{ steps.fetch_data_production.outputs.pr_merged_time }}
+  pr_title:
+    description: "PR title"
+    value: ${{ steps.fetch_data_production.outputs.pr_title }}
+  run-id:
+    description: "Github run-id of workflow"
+    value: ${{ github.run_id }}
+runs:
+  using: "composite"
+  steps:
+    - name: Fetch pr_id and quality_gates_status from Staging
+      id: fetch_data_staging
+      continue-on-error: true
+      shell: bash
+      run: |
+        response=$(curl --retry 3 --retry-connrefused -s "https://${{ inputs.orchestrator-base-url-stg }}/get_pr_id/repo/${{ inputs.app }}/pr_number/${{ inputs.pr-number }}")
+        pr_id=$(echo "$response" | jq -r '.pr_id')
+
+        if [ "$pr_id" == "null" ] || [ -z "$pr_id" ]; then
+          echo "Error: staging pr_id not found in response."
+          exit 1
+        fi
+
+        echo "Staging pr_id: $pr_id"
+
+        # Fetch the quality gates status
+        quality_gates_url="https://${{ inputs.orchestrator-base-url-stg }}/get_checkrun_by_prid/${pr_id}"
+        echo "Calling quality gates URL: $quality_gates_url"
+        quality_gates_conclusion_response=$(curl --retry 3 --retry-connrefused -s "$quality_gates_url")
+
+        quality_gates_conclusion=$(echo "$quality_gates_conclusion_response" | jq -r '.conclusion // null')
+        echo "Quality gates conclusion: $quality_gates_conclusion"
+
+        # Fetch PR merged time and PR title
+        pr_data_url="https://${{ inputs.orchestrator-base-url-stg }}/get_pr_by_id/${pr_id}"
+        echo "Calling PR data URL: $pr_data_url"
+        pr_data_response=$(curl --retry 3 --retry-connrefused -s "$pr_data_url")
+        pr_merged_time=$(echo "$pr_data_response" | jq -r '.merged_at // null')
+        pr_title=$(echo "$pr_data_response" | jq -r '.pr_title')
+        echo "PR merged time: $pr_merged_time"
+        echo "PR title: $pr_title"
+
+        # Output the values
+        echo "pr_id=$pr_id" >> $GITHUB_OUTPUT
+        echo "quality_gates_conclusion=$quality_gates_conclusion" >> $GITHUB_OUTPUT
+        echo "pr_merged_time=$pr_merged_time" >> $GITHUB_OUTPUT
+        echo "pr_title=$pr_title" >> $GITHUB_OUTPUT
+
+    - name: Fetch pr_id and quality_gates_status from Production
+      id: fetch_data_production
+      continue-on-error: true
+      shell: bash
+      run: |
+        response=$(curl --retry 3 --retry-connrefused -s "https://${{ inputs.orchestrator-base-url-prd }}/get_pr_id/repo/${{ inputs.app }}/pr_number/${{ inputs.pr-number }}")
+        pr_id=$(echo "$response" | jq -r '.pr_id')
+
+        if [ "$pr_id" == "null" ] || [ -z "$pr_id" ]; then
+          echo "Error: production pr_id not found in response."
+          exit 1
+        fi
+
+        echo "Production pr_id: $pr_id"
+
+        # Fetch the quality gates status
+        quality_gates_url="https://${{ inputs.orchestrator-base-url-prd }}/get_checkrun_by_prid/${pr_id}"
+        quality_gates_conclusion_response=$(curl --retry 3 --retry-connrefused -s "$quality_gates_url")
+
+        quality_gates_conclusion=$(echo "$quality_gates_conclusion_response" | jq -r '.conclusion // null')
+        echo "Quality gates conclusion: $quality_gates_conclusion"
+
+        # Fetch PR merged time and PR title
+        pr_data_url="https://${{ inputs.orchestrator-base-url-prd }}/get_pr_by_id/${pr_id}"
+        pr_data_response=$(curl --retry 3 --retry-connrefused -s "$pr_data_url")
+        pr_merged_time=$(echo "$pr_data_response" | jq -r '.merged_at // null')
+        pr_title=$(echo "$pr_data_response" | jq -r '.pr_title')
+
+        echo "PR merged time: $pr_merged_time"
+        echo "PR title: $pr_title"
+
+        # Output the values
+        echo "quality_gates_conclusion=$quality_gates_conclusion" >> $GITHUB_OUTPUT
+        echo "pr_id=$pr_id" >> $GITHUB_OUTPUT
+        echo "pr_merged_time=$pr_merged_time" >> $GITHUB_OUTPUT
+        echo "pr_title=$pr_title" >> $GITHUB_OUTPUT
+
+    - name: Post Workflow Run Metadata to Staging
+      continue-on-error: true
+      shell: bash
+      run: |
+        # Set JSON field correctly: use null without quotes if the value is the string "null"
+        pr_merged_time="${{ steps.fetch_data_staging.outputs.pr_merged_time }}"
+        if [ "$pr_merged_time" = "null" ]; then
+          merged_at_json='null'
+        else
+          merged_at_json="\"$pr_merged_time\""
+        fi
+
+        # Set quality_gates_conclusion correctly: use null without quotes if the value is the string "null"
+        quality_gates_conclusion="${{ steps.fetch_data_staging.outputs.quality_gates_conclusion }}"
+        if [ "$quality_gates_conclusion" = "null" ]; then
+          quality_gates_conclusion_json='null'
+        else
+          quality_gates_conclusion_json="\"$quality_gates_conclusion\""
+        fi
+
+        environment_input='${{ inputs.environments }}'
+        multiple_environments='${{ inputs.multiple-environments }}'
+        if [ "$multiple_environments" = "true" ]; then
+          env_string=$(echo "$environment_input" | jq -r 'join(",")')
+        else
+          env_string="$environment_input"
+        fi
+        env_string_json="\"$env_string\""
+
+        response=$(curl -s -o /dev/null --retry 3 --retry-connrefused -w '%{response_code}' -X POST "https://${{ inputs.orchestrator-base-url-stg }}/github-webhook/workflow_run_update" \
+          -H "x-api-key: ${{ inputs.orchestrator-api-key-stg }}" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "request_id": ${{ toJSON(inputs.request-id || null) }},
+            "run_id": ${{ github.run_id }},
+            "pr_number": ${{ inputs.pr-number }},
+            "pr_id": ${{ steps.fetch_data_staging.outputs.pr_id }},
+            "repository": "${{ inputs.app-repository }}",
+            "environment": '$env_string_json',
+            "feature_name": "${{ inputs.app }}",
+            "branch": "${{ inputs.branch }}",
+            "deployment_type": "${{ inputs.deployment-type }}",
+            "version": "${{ inputs.version }}",
+            "quality_gates_conclusion": '$quality_gates_conclusion_json',
+            "merged_at": '$merged_at_json',
+            "pr_title": "${{ steps.fetch_data_staging.outputs.pr_title }}"
+          }')
+        if [ "$response" != "200" ]; then
+          echo "::error::Failed to post workflow run status. Status code: $response"
+          exit 1
+        fi
+    - name: Post Workflow Run Metadata to Production
+      continue-on-error: true
+      shell: bash
+      run: |
+        # Set JSON field correctly: use null without quotes if the value is the string "null"
+        pr_merged_time="${{ steps.fetch_data_staging.outputs.pr_merged_time }}"
+        if [ "$pr_merged_time" = "null" ]; then
+          merged_at_json='null'
+        else
+          merged_at_json="\"$pr_merged_time\""
+        fi
+
+        # Set quality_gates_conclusion correctly: use null without quotes if the value is the string "null"
+        quality_gates_conclusion="${{ steps.fetch_data_staging.outputs.quality_gates_conclusion }}"
+        if [ "$quality_gates_conclusion" = "null" ]; then
+          quality_gates_conclusion_json='null'
+        else
+          quality_gates_conclusion_json="\"$quality_gates_conclusion\""
+        fi
+
+        environment_input='${{ inputs.environments }}'
+        multiple_environments='${{ inputs.multiple-environments }}'
+        if [ "$multiple_environments" = "true" ]; then
+          env_string=$(echo "$environment_input" | jq -r 'join(",")')
+        else
+          env_string="$environment_input"
+        fi
+        env_string_json="\"$env_string\""
+
+        response=$(curl -s -o /dev/null --retry 3 --retry-connrefused -w '%{response_code}' -X POST "https://${{ inputs.orchestrator-base-url-prd }}/github-webhook/workflow_run_update" \
+          -H "x-api-key: ${{ inputs.orchestrator-api-key-prd }}" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "request_id": ${{ toJSON(inputs.request-id || null) }},
+            "run_id": ${{ github.run_id }},
+            "pr_number": ${{ inputs.pr-number }},
+            "pr_id": ${{ steps.fetch_data_production.outputs.pr_id }},
+            "repository": "${{ inputs.app-repository }}",
+            "environment": '$env_string_json',
+            "feature_name": "${{ inputs.app }}",
+            "branch": "${{ inputs.branch }}",
+            "deployment_type": "${{ inputs.deployment-type }}",
+            "version": "${{ inputs.version }}",
+            "quality_gates_conclusion": '$quality_gates_conclusion_json',
+            "merged_at": '$merged_at_json',
+            "pr_title": "${{ steps.fetch_data_production.outputs.pr_title }}"
+          }')
+        if [ "$response" != "200" ]; then
+          echo "::error::Failed to post workflow run status. Status code: $response"
+          exit 1
+        fi
